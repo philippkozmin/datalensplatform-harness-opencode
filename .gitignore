@@ -1,0 +1,6 @@
+# Runtime state created by the main_orchestration skill in the working project dir.
+/memory/
+/side-cars/
+
+# Dependencies
+node_modules/
