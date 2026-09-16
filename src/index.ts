@@ -88,6 +88,7 @@ async function copyAgentMd(): Promise<string> {
  * Idempotently merge the harness defaults into the user's GLOBAL opencode.json:
  *   - mcp.spark-connect        — only if the user hasn't configured it (their override, incl.
  *                                `{ "enabled": false }`, always wins).
+ *   - mcp.dlp-api              — same rule as spark-connect.
  *   - permission.skill.main_orchestration = "allow" — only if the user has no explicit rule.
  *   - instructions += <config-dir>/datalens-harness/AGENTS.md — cleans stale datalens entries
  *                                (covers paths from older harness versions) and adds ours.
@@ -127,6 +128,17 @@ async function ensureGlobalConfig(agentMdPath: string): Promise<void> {
       value: {
         type: "local",
         command: ["node", join(SOURCES, "mcp", "spark-connect", "server.mjs")],
+      },
+    })
+  }
+
+  // mcp.dlp-api — only if the user hasn't configured it.
+  if (!mcp["dlp-api"]) {
+    ops.push({
+      path: ["mcp", "dlp-api"],
+      value: {
+        type: "local",
+        command: ["node", join(SOURCES, "mcp", "dlp-api", "server.mjs")],
       },
     })
   }

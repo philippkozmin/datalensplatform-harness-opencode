@@ -1,7 +1,7 @@
 {
   "name": "opencode-datalens-harness",
   "version": "0.1.1",
-  "description": "OpenCode plugin: DataLens Platform harness. Registers the get_iam_token and get_harness_session_id tools natively, bootstraps the main_orchestration and sparkconnect skills and the engineer/scheduler subagents into ~/.config/opencode, writes mcp/permission/instructions into the global opencode.json (idempotent, fs + jsonc-parser), and bundles a spark-connect MCP server. Zero runtime hooks.",
+  "description": "OpenCode plugin: DataLens Platform harness. Registers the get_iam_token and get_harness_session_id tools natively, bootstraps the main_orchestration and sparkconnect skills and the engineer/scheduler subagents into ~/.config/opencode, writes mcp/permission/instructions into the global opencode.json (idempotent, fs + jsonc-parser), and bundles the spark-connect and dlp-api (runSqlQuery, listCatalogs, prod/preprod) MCP servers. Zero runtime hooks.",
   "type": "module",
   "main": "src/index.ts",
   "exports": "./src/index.ts",
@@ -33,7 +33,8 @@
   },
   "license": "MIT",
   "dependencies": {
-    "jsonc-parser": "^3.3.1"
+    "jsonc-parser": "^3.3.1",
+    "opencode-datalens-harness": "^0.1.0"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"

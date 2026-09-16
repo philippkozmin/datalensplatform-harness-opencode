@@ -1,21 +1,26 @@
 #!/usr/bin/env node
 /**
- * spark-connect — zero-dependency MCP stdio server for Yandex Managed Spark "Spark Connect".
+ * spark-connect — zero-dependency MCP stdio server for DataLens Platform Spark Connect.
  *
- * In Managed Spark, a Spark Connect session is a SparkConnect *job* on a cluster. This server
- * manages that job's lifecycle by shelling out to the `yc` CLI (which authenticates itself):
+ * A Spark Connect session is a SparkConnect *job* on a DLP Spark cluster. The jobs live behind
+ * the DLP lakehouse gateway (RPC API), NOT behind the raw `yc managed-spark job ...` API —
+ * DLP clusters answer Permission denied there. Tools:
  *
- *   - create_spark_connection : yc managed-spark job create-spark-connect
- *   - list_spark_jobs         : yc managed-spark job list
- *   - cancel_spark_connection : yc managed-spark job cancel
+ *   - create_spark_connection : POST /rpc/createSparkJob  (variant sparkConnectJob, catalogs[])
+ *   - list_spark_jobs         : POST /rpc/listSparkJobs
+ *   - cancel_spark_connection : POST /rpc/cancelSparkJob
  *
- * It does NOT assemble the connect URI or hold a session — building a PySpark SparkSession from
- * the job's connect_url + an IAM token is described in the `sparkconnect` skill.
+ * cluster_id everywhere is the DLP SparkCluster id (b6p...), not the YC managed cluster id.
+ * The IAM token is minted via the `yc` CLI (prod: default profile, preprod: sandbox-preprod)
+ * and sent as the Authorization Bearer header together with x-dl-api-version: 3 and
+ * x-dl-org-id. It does NOT assemble the connect URI or hold a session — building a PySpark
+ * SparkSession from the job's connectUrl + an IAM token is described in the `sparkconnect`
+ * skill.
  *
  * Protocol: minimal MCP over stdio (newline-delimited JSON-RPC 2.0): initialize, tools/list,
  * tools/call. No external dependencies — runs with plain `node`.
  *
- * Docs: https://yandex.cloud/en/docs/managed-spark/operations/jobs-sparkconnect
+ * Docs: https://api.datalens.tech/#/SparkJobs (OpenAPI spec at GET /json/)
  *
  * ---------------------------------------------------------------------------
  * Side-cars logging (OpenCode)
@@ -89,7 +94,7 @@ function runYc(args) {
   })
 }
 
-/** Resolve the cluster id from the tool arg or the YC_SPARK_CLUSTER_ID env var. */
+/** Resolve the DLP cluster id from the tool arg or the YC_SPARK_CLUSTER_ID env var. */
 function resolveClusterId(args) {
   const id = args?.cluster_id || process.env.YC_SPARK_CLUSTER_ID
   if (!id) {
@@ -101,6 +106,47 @@ function resolveClusterId(args) {
 }
 
 // ---------------------------------------------------------------------------
+// DLP RPC API (Spark Connect jobs live behind the lakehouse gateway — the raw
+// `yc managed-spark job ...` API answers Permission denied for DLP clusters)
+// ---------------------------------------------------------------------------
+
+const DLP_API_BASE = {
+  prod: "https://api.datalens.tech",
+  preprod: "https://api.preprod.datalens.tech",
+}
+
+function dlpTokenArgs(environment) {
+  return environment === "preprod"
+    ? ["--profile", "sandbox-preprod", "iam", "create-token"]
+    : ["iam", "create-token"]
+}
+
+async function dlpRpc(environment, method, orgId, body) {
+  const base = DLP_API_BASE[environment]
+  if (!base) throw new Error(`unknown environment: ${environment} (use "prod" or "preprod")`)
+  const org = orgId || process.env.DLP_ORG_ID
+  if (!org) {
+    throw new Error(
+      "org_id is required (pass it as an argument or set the DLP_ORG_ID environment variable)",
+    )
+  }
+  const token = (await runYc(dlpTokenArgs(environment))).trim()
+  const res = await fetch(`${base}/rpc/${method}`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "x-dl-api-version": "3",
+      "x-dl-org-id": org,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body ?? {}),
+  })
+  const text = await res.text()
+  if (!res.ok) throw new Error(`DLP RPC ${method} -> HTTP ${res.status}: ${text.trim().slice(0, 500)}`)
+  return text
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
@@ -108,69 +154,91 @@ const TOOLS = [
   {
     name: "create_spark_connection",
     description:
-      "Create a Spark Connect session (a SparkConnect job) on a Yandex Managed Spark cluster. " +
-      "Returns the created job (id, status, and connect_url if already available). Use list_spark_jobs " +
-      "afterwards to read the connect_url once the job is running.",
+      "Create a Spark Connect session (a SparkConnect job) on a DLP Spark cluster via the DLP RPC " +
+      "API (POST /rpc/createSparkJob, variant sparkConnectJob). cluster_id is the DLP SparkCluster " +
+      "id (b6p..., field 'id' of list_spark_clusters) — NOT the YC managed cluster id. Returns the " +
+      "created job or an async LakehouseOperation (poll with get_lakehouse_operation of the " +
+      "dlp-api server); read connectUrl via list_spark_jobs.",
     inputSchema: {
       type: "object",
       properties: {
         cluster_id: {
           type: "string",
-          description: "Managed Spark cluster id. Falls back to the YC_SPARK_CLUSTER_ID env var.",
+          description: "DLP SparkCluster id (b6p...). Falls back to the YC_SPARK_CLUSTER_ID env var.",
         },
-        name: { type: "string", description: "Optional name for the SparkConnect job." },
+        name: { type: "string", description: "Optional job name ([a-z][-a-z0-9]{1,62}[a-z0-9])." },
+        catalogs: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional REST catalog ids (from list_catalogs) to attach to the job.",
+        },
+        environment: { type: "string", description: 'DLP environment: "prod" (default) or "preprod".' },
+        org_id: { type: "string", description: "Organization id (x-dl-org-id). Falls back to the DLP_ORG_ID env var." },
       },
     },
     run: async (args) => {
       const cluster = resolveClusterId(args)
-      const cmd = ["managed-spark", "job", "create-spark-connect", "--cluster-id", cluster]
-      if (args?.name) cmd.push("--name", String(args.name))
-      cmd.push("--format", "json")
-      return runYc(cmd)
+      const body = { clusterId: String(cluster), sparkConnectJob: {} }
+      if (args?.name) body.name = String(args.name)
+      if (Array.isArray(args?.catalogs) && args.catalogs.length) {
+        body.catalogs = args.catalogs.map((id) => ({ catalogId: String(id) }))
+      }
+      return dlpRpc(args?.environment || "prod", "createSparkJob", args?.org_id, body)
     },
   },
   {
     name: "list_spark_jobs",
     description:
-      "List jobs on a Yandex Managed Spark cluster (including SparkConnect jobs). Use it to find the " +
-      "running job, its status, and its connect_url (e.g. sc://...:443) for building a PySpark session.",
+      "List Spark jobs on a DLP Spark cluster via the DLP RPC API (POST /rpc/listSparkJobs). " +
+      "cluster_id is the DLP SparkCluster id (b6p...). Use it to find the running job, its status " +
+      "and its connectUrl (e.g. sc://...:443) for building a PySpark session.",
     inputSchema: {
       type: "object",
       properties: {
         cluster_id: {
           type: "string",
-          description: "Managed Spark cluster id. Falls back to the YC_SPARK_CLUSTER_ID env var.",
+          description: "DLP SparkCluster id (b6p...). Falls back to the YC_SPARK_CLUSTER_ID env var.",
         },
+        page_size: { type: "integer", description: "Max jobs to return (default 100)." },
+        page_token: { type: "string", description: "Token for the next page." },
+        environment: { type: "string", description: 'DLP environment: "prod" (default) or "preprod".' },
+        org_id: { type: "string", description: "Organization id (x-dl-org-id). Falls back to the DLP_ORG_ID env var." },
       },
     },
     run: async (args) => {
       const cluster = resolveClusterId(args)
-      return runYc(["managed-spark", "job", "list", "--cluster-id", cluster, "--format", "json"])
+      const body = { clusterId: String(cluster) }
+      if (args?.page_size != null) body.pageSize = Number(args.page_size)
+      if (args?.page_token) body.pageToken = String(args.page_token)
+      return dlpRpc(args?.environment || "prod", "listSparkJobs", args?.org_id, body)
     },
   },
   {
     name: "cancel_spark_connection",
     description:
-      "Cancel (shut down) a SparkConnect job on a Yandex Managed Spark cluster. Jobs in ERROR, DONE, " +
-      "or CANCELLED status cannot be cancelled.",
+      "Cancel (shut down) a SparkConnect job on a DLP Spark cluster via the DLP RPC API " +
+      "(POST /rpc/cancelSparkJob). cluster_id is the DLP SparkCluster id (b6p...). Jobs in ERROR, " +
+      "DONE, or CANCELLED status cannot be cancelled.",
     inputSchema: {
       type: "object",
       properties: {
         cluster_id: {
           type: "string",
-          description: "Managed Spark cluster id. Falls back to the YC_SPARK_CLUSTER_ID env var.",
+          description: "DLP SparkCluster id (b6p...). Falls back to the YC_SPARK_CLUSTER_ID env var.",
         },
         job_id: { type: "string", description: "Id of the SparkConnect job to cancel." },
+        environment: { type: "string", description: 'DLP environment: "prod" (default) or "preprod".' },
+        org_id: { type: "string", description: "Organization id (x-dl-org-id). Falls back to the DLP_ORG_ID env var." },
       },
       required: ["job_id"],
     },
     run: async (args) => {
       const cluster = resolveClusterId(args)
       if (!args?.job_id) throw new Error("job_id is required")
-      return runYc([
-        "managed-spark", "job", "cancel", String(args.job_id),
-        "--cluster-id", cluster, "--format", "json",
-      ])
+      return dlpRpc(args?.environment || "prod", "cancelSparkJob", args?.org_id, {
+        clusterId: String(cluster),
+        jobId: String(args.job_id),
+      })
     },
   },
 ]
@@ -202,7 +270,12 @@ async function handleToolCall(id, params) {
   }
   // Log tool name + non-secret identifiers only (never connect_url / token).
   const a = params?.arguments || {}
-  const ctx = [a.cluster_id && `cluster=${a.cluster_id}`, a.job_id && `job=${a.job_id}`]
+  const ctx = [
+    a.cluster_id && `cluster=${a.cluster_id}`,
+    a.job_id && `job=${a.job_id}`,
+    a.environment && `env=${a.environment}`,
+    a.name && `name=${a.name}`,
+  ]
     .filter(Boolean)
     .join(" ")
   logLine(`call ${params.name}${ctx ? " " + ctx : ""}`)

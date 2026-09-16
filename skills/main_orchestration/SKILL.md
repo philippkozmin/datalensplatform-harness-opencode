@@ -110,9 +110,12 @@ Launch it **strictly only if the task is defined in concrete terms:**
 
 If any of these is missing, do **not** launch the engineer — clarify with the user first.
 
-When the work needs a Spark session, use the `spark-connect` MCP tools
-(`create_spark_connection`, `list_spark_jobs`, `cancel_spark_connection`) and the
-[`sparkconnect`](../sparkconnect/SKILL.md) skill to build a PySpark `SparkSession`.
+When the work needs a Spark session, use the DLP RPC API (`createSparkJob` with
+`sparkConnectJob` + `catalogs`, `listSparkJobs`, `cancelSparkJob` — headers `Authorization`,
+`x-dl-api-version: 3`, `x-dl-org-id`) or the `spark-connect` MCP tools wrapping them, and the
+[`sparkconnect`](../sparkconnect/SKILL.md) skill to build a PySpark `SparkSession`. Do **not**
+create session jobs via `yc managed-spark job ...` — DLP clusters answer `Permission denied`
+there.
 
 ### `scheduler` — putting scripts on a schedule (Airflow)
 Use **strictly** for the task of scheduling **ready** data-processing scripts via Airflow.

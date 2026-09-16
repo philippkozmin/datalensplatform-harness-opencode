@@ -43,6 +43,32 @@ If a step needs a Yandex Cloud token, obtain a fresh one **yourself** by calling
 **`get_iam_token`** tool (bundled with this harness) and capture the returned token. Do not assume
 it is in the environment, and never write it to side-cars.
 
+## IAM tokens inside DAGs (Managed Airflow workers)
+
+DAGs running on **Yandex Managed Airflow** must obtain the IAM token **at runtime on the worker**
+from the service account attached to the cluster — never inline a static token in the DAG source
+(IAM tokens expire within 12 hours and would leak a secret into git). The documented pattern
+(https://yandex.cloud/ru/docs/managed-airflow/operations/get-iam-token):
+
+```python
+import yandexcloud
+
+def get_iam_token():
+    sdk = yandexcloud.SDK()
+    return sdk._channels._token_requester.get_token()
+```
+
+- The `yandexcloud` package is pre-installed on Managed Airflow workers (module-level import is
+  safe there).
+- Call `get_iam_token()` **inside the task callable** and pass the token explicitly (e.g.
+  `iam_token=...`) to the code that needs it; never log or store it.
+- For **local** verification without a worker/`yandexcloud` installed, stub the module in
+  `sys.modules` (fake `SDK()._channels._token_requester.get_token()` returning a real token
+  obtained via the `get_iam_token` tool / `yc`) and run the callable.
+- Note the subject of this token is the **cluster's service account**: DLP/API authorization of
+  that SA (roles/licence) must be configured separately; 401/403 from the API usually means the
+  SA lacks access, not that the code is wrong.
+
 ## Repository handling & code delivery
 
 Placing a DAG file on disk is **not sufficient** when the Airflow repository is a checkout of an
