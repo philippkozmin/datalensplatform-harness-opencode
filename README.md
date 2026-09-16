@@ -10,6 +10,38 @@ DataLens Platform (DLP) through the OpenCode CLI agent. It ships:
 - **dlp-api** — a single MCP server for the whole DLP RPC API (prod/preprod, `environment` arg): SQL queries (`run_sql_query`), REST/lakehouse catalogs (`list_catalogs`), the OpenAPI spec (`get_api_spec`), Spark clusters (`list_spark_clusters`, `create_spark_cluster`, `get_lakehouse_operation`) and Spark Connect job lifecycle (`create_spark_connection`, `list_spark_jobs`, `cancel_spark_connection` — the former `spark-connect` server, merged in 0.2.0). The IAM token comes from the `iam_token` arg / `DLP_IAM_TOKEN` env or is minted by the server via `yc` (preprod: `--profile sandbox-preprod`); org id from `org_id` / `DLP_ORG_ID`.
 - **engineer / scheduler** — hidden subagents for data-processing code and Airflow scheduling.
 
+## What's inside
+
+```
+opencode-datalens-harness/
+│
+├── skills/                       # force-copied to ~/.config/opencode/skills on every load
+│   ├── main_orchestration/       # entry point of ANY DLP task: token → memory → side-cars → subagent routing
+│   ├── sparkconnect/             # PySpark SparkSession over DLP Spark Connect (createSparkJob → sc://…)
+│   ├── dlp-sql-query/            # saved SQL queries in workbooks (createSqlQuery/runSqlQuery) + Trino connection recipe
+│   ├── dlp-preprod/              # preprod override: sandbox-preprod yc profile + api.preprod.datalens.tech
+│   ├── dlp-delete/               # guard for destructive ops: confirmation gate before any delete RPC
+│   └── iam-whoami/               # whom an IAM token belongs to (ycp/yc iam whoami → DLP user id)
+│
+├── mcp/                          # wired into the global opencode.json `mcp` block
+│   └── dlp-api/                  # ONE server for the whole DLP RPC API (prod/preprod), 9 tools:
+│       └── server.mjs            #   run_sql_query · list_catalogs · get_api_spec ·
+│                                 #   list_spark_clusters · create_spark_cluster · get_lakehouse_operation ·
+│                                 #   create_spark_connection · list_spark_jobs · cancel_spark_connection
+│                                 # (the former spark-connect server, merged in 0.2.0)
+│
+├── agents/                       # copied to ~/.config/opencode/agents; hidden, launched only via the task tool
+│   ├── engineer.md               # data-processing code (SQL/Python/Scala); communicates via side-cars only
+│   └── scheduler.md              # Airflow scheduling of ready scripts; IAM token minted on the worker, never in the DAG
+│
+├── tools/                        # native plugin tools (not MCP)
+│   ├── get_iam_token.ts          # IAM token via the yc CLI
+│   └── get_harness_session_id.ts # sessionID + sidecarsBase for the inter-agent channel
+│
+└── src/index.ts                  # bootstrap: copies skills/agents/tools → ~/.config/opencode, idempotent
+                                  # merge into opencode.json (mcp.dlp-api, permission.skill, instructions)
+```
+
 **Prerequisites:** the [`yc` CLI](https://yandex.cloud/en/docs/cli/quickstart) installed and
 authenticated — `yc iam create-token` must work — and [`node`](https://nodejs.org) on PATH for the
 Spark Connect MCP server.
