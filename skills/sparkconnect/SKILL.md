@@ -98,7 +98,7 @@ retry budget (**≤ 3 timeout errors, or ≤ 1 non-timeout error, then stop**) �
 ## Notes
 
 - The connect URI embeds a live IAM token — treat it as a secret, use it inline, do not persist it.
-- MCP tools of the `spark-connect` server wrap the same RPCs (`create_spark_connection`,
+- MCP tools of the `dlp-api` server wrap the same RPCs (`create_spark_connection`,
   `list_spark_jobs`, `cancel_spark_connection`, `list_catalogs`); pass DLP cluster ids there too.
 - The gateway validates resource presets on cluster creation (e.g. `c2-m8` rejected,
   `c4-m16` accepted) — see the `dlp-api` MCP tools for cluster management.

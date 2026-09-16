@@ -7,8 +7,7 @@ DataLens Platform (DLP) through the OpenCode CLI agent. It ships:
 - **get_iam_token** — a native tool that returns a Yandex Cloud IAM token via the `yc` CLI.
 - **get_harness_session_id** — a native tool that resolves the session id and the side-cars base path (OpenCode does not expose the session id to the model otherwise).
 - **sparkconnect** — a skill that builds a PySpark `SparkSession` over Spark Connect.
-- **spark-connect** — an MCP server managing a Yandex Managed Spark SparkConnect job lifecycle.
-- **dlp-api** — an MCP server with the `run_sql_query` (POST /rpc/runSqlQuery) and `list_catalogs` (POST /rpc/listCatalogs, REST/lakehouse catalogs) tools calling the DLP API; needs a fresh IAM token and org id (`DLP_ORG_ID` env or `org_id` arg). Target environment per call: `environment: "prod"` (default, api.datalens.tech) or `"preprod"` (api.preprod.datalens.tech) — chosen by the user's session context; env vars `DLP_ENVIRONMENT` / `DLP_API_BASE_URL` for a fixed setup.
+- **dlp-api** — a single MCP server for the whole DLP RPC API (prod/preprod, `environment` arg): SQL queries (`run_sql_query`), REST/lakehouse catalogs (`list_catalogs`), the OpenAPI spec (`get_api_spec`), Spark clusters (`list_spark_clusters`, `create_spark_cluster`, `get_lakehouse_operation`) and Spark Connect job lifecycle (`create_spark_connection`, `list_spark_jobs`, `cancel_spark_connection` — the former `spark-connect` server, merged in 0.2.0). The IAM token comes from the `iam_token` arg / `DLP_IAM_TOKEN` env or is minted by the server via `yc` (preprod: `--profile sandbox-preprod`); org id from `org_id` / `DLP_ORG_ID`.
 - **engineer / scheduler** — hidden subagents for data-processing code and Airflow scheduling.
 
 **Prerequisites:** the [`yc` CLI](https://yandex.cloud/en/docs/cli/quickstart) installed and
@@ -39,9 +38,10 @@ On startup the plugin:
    `~/.config/opencode/datalens-harness/AGENTS.md`;
 3. **writes the global `opencode.json`** (idempotent, comment-safe, via direct fs +
    `jsonc-parser` — the same lib OpenCode uses) to merge in:
-    - `mcp.spark-connect` → `command: ["node", <package>/mcp/spark-connect/server.mjs]`,
-    - `mcp.dlp-api` → `command: ["node", <package>/mcp/dlp-api/server.mjs]`,
-   - `permission.skill.main_orchestration: "allow"` (skips the skill-load confirmation prompt),
+     - `mcp.dlp-api` → `command: ["node", <package>/mcp/dlp-api/server.mjs]`,
+     - removal of the stale `mcp.spark-connect` entry written by versions < 0.2.0
+       (only when it points at the harness-shipped server),
+    - `permission.skill.main_orchestration: "allow"` (skips the skill-load confirmation prompt),
    - `instructions += <config-dir>/datalens-harness/AGENTS.md`;
 4. registers the native tools (`get_iam_token`, `get_harness_session_id`) — available immediately.
 
@@ -49,7 +49,8 @@ Why a file write instead of an in-memory hook: `instructions`/`permission`/`mcp`
 restart reliably. An in-memory `config`-hook mutation of `cfg.mcp` races with OpenCode's MCP layer
 (which reads `cfg.mcp` once at its own startup), so the plugin writes the real file instead. The SDK
 can't write the global config (and `PATCH /config` disposes the running instance), hence the direct
-fs write. The write is idempotent and only ever **adds** missing keys — your existing entries win.
+fs write. The write is idempotent: it only ever **adds** missing keys — your existing entries win
+(the single exception: removing the plugin's own stale `mcp.spark-connect` entry from < 0.2.0).
 
 **Restart OpenCode once after the first install.** The running session has already loaded its
 config before the plugin writes, so the merged keys take effect from the next restart onward.
@@ -58,9 +59,9 @@ config before the plugin writes, so the merged keys take effect from the next re
 
 The plugin never clobbers your config — it only fills in absent keys:
 
-- **MCP**: to use your own `spark-connect` or `dlp-api` (custom path, env, or to disable it),
+- **MCP**: to use your own `dlp-api` (custom path, env, or to disable it),
   add any entry of that name to your `mcp` block — its mere presence makes the plugin skip its
-  default. To turn a server off: `"mcp": { "dlp-api": { "enabled": false } }`.
+  default. To turn the server off: `"mcp": { "dlp-api": { "enabled": false } }`.
 - **Permission**: an explicit `permission.skill.main_orchestration` rule (any value) makes the
   plugin leave it alone.
 - **Instructions**: the plugin refreshes its own `datalens-harness/AGENTS.md` entry each load

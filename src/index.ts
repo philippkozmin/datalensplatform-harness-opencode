@@ -86,9 +86,10 @@ async function copyAgentMd(): Promise<string> {
 
 /**
  * Idempotently merge the harness defaults into the user's GLOBAL opencode.json:
- *   - mcp.spark-connect        — only if the user hasn't configured it (their override, incl.
+ *   - mcp.dlp-api              — only if the user hasn't configured it (their override, incl.
  *                                `{ "enabled": false }`, always wins).
- *   - mcp.dlp-api              — same rule as spark-connect.
+ *   - mcp.spark-connect        — stale entries pointing at the harness-shipped server (versions
+ *                                < 0.2.0) are removed; the tools live in dlp-api now.
  *   - permission.skill.main_orchestration = "allow" — only if the user has no explicit rule.
  *   - instructions += <config-dir>/datalens-harness/AGENTS.md — cleans stale datalens entries
  *                                (covers paths from older harness versions) and adds ours.
@@ -120,16 +121,20 @@ async function ensureGlobalConfig(agentMdPath: string): Promise<void> {
   type Op = { path: (string | number)[]; value: unknown }
   const ops: Op[] = []
 
-  // mcp.spark-connect — only if the user hasn't configured it.
   const mcp = obj.mcp && typeof obj.mcp === "object" ? (obj.mcp as Record<string, unknown>) : {}
-  if (!mcp["spark-connect"]) {
-    ops.push({
-      path: ["mcp", "spark-connect"],
-      value: {
-        type: "local",
-        command: ["node", join(SOURCES, "mcp", "spark-connect", "server.mjs")],
-      },
-    })
+
+  // mcp.spark-connect — removed in 0.2.0 (its tools were merged into the dlp-api server — it
+  // is the same DLP RPC API). Drop the stale entry older harness versions wrote, but only when
+  // it points at OUR shipped server; a user's own spark-connect server is never touched.
+  const staleSparkConnect = mcp["spark-connect"]
+  if (staleSparkConnect && typeof staleSparkConnect === "object") {
+    const command = (staleSparkConnect as Record<string, unknown>).command
+    if (Array.isArray(command)) {
+      const cmd = command.join(" ").replace(/\\/g, "/")
+      if (cmd.includes("opencode-datalens-harness") && cmd.endsWith("/mcp/spark-connect/server.mjs")) {
+        ops.push({ path: ["mcp", "spark-connect"], value: undefined })
+      }
+    }
   }
 
   // mcp.dlp-api — only if the user hasn't configured it.

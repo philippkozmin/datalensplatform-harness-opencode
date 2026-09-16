@@ -56,7 +56,7 @@ Step 0, the layout is:
   <agent>_result.md    # final result: subagent → main
   <agent>_status.md    # live "currently working on…" heartbeat: subagent → main
   log.md               # append-only coordination / hand-offs
-  logs/                # component & command logs (spark-connect.log, get_iam_token.log, <agent>.log)
+  logs/                # component & command logs (dlp-api.log, get_iam_token.log, <agent>.log)
 ```
 
 Rules:
@@ -112,7 +112,7 @@ If any of these is missing, do **not** launch the engineer — clarify with the 
 
 When the work needs a Spark session, use the DLP RPC API (`createSparkJob` with
 `sparkConnectJob` + `catalogs`, `listSparkJobs`, `cancelSparkJob` — headers `Authorization`,
-`x-dl-api-version: 3`, `x-dl-org-id`) or the `spark-connect` MCP tools wrapping them, and the
+`x-dl-api-version: 3`, `x-dl-org-id`) or the `dlp-api` MCP tools wrapping them, and the
 [`sparkconnect`](../sparkconnect/SKILL.md) skill to build a PySpark `SparkSession`. Do **not**
 create session jobs via `yc managed-spark job ...` — DLP clusters answer `Permission denied`
 there.

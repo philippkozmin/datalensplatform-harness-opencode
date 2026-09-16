@@ -53,7 +53,7 @@ a call fails with an auth error.
 ## Spark sessions (Spark Connect)
 
 When the task needs Spark, build the session per the [`sparkconnect`](../../skills/sparkconnect/SKILL.md)
-skill using the `spark-connect` MCP tools (`create_spark_connection`, `list_spark_jobs`,
+skill using the `dlp-api` MCP tools (`create_spark_connection`, `list_spark_jobs`,
 `cancel_spark_connection`).
 
 - **Retry budget — stop, don't loop.** Give up after **at most 3 timeout errors** OR **1

@@ -2,40 +2,33 @@
 /**
  * dlp-api — zero-dependency MCP stdio server for the DataLens Platform (DLP) public API.
  *
- * Tools:
+ * One server for the whole DLP RPC API (the former `spark-connect` server is merged in —
+ * Spark Connect jobs, clusters, catalogs, SQL queries all live behind the same gateway):
  *
- *   - run_sql_query : POST {base}/rpc/runSqlQuery
- *       headers: x-dl-org-id, x-dl-api-version: 3, authorization: Bearer <IAM token>
- *       body:    { sqlQueryId, params? }
+ *   - run_sql_query          : POST {base}/rpc/runSqlQuery        { sqlQueryId, params? }
+ *   - list_catalogs          : POST {base}/rpc/listCatalogs       { pageSize?, pageToken? }
+ *   - get_api_spec           : GET  {base}/json/                  OpenAPI 3.1 spec (optional path_filter)
+ *   - list_spark_clusters    : POST {base}/rpc/listSparkClusters  { pageSize?, pageToken?, filter? }
+ *   - create_spark_cluster   : POST {base}/rpc/createSparkCluster → async LakehouseOperation
+ *   - get_lakehouse_operation: POST {base}/rpc/getLakehouseOperation { operationId }
+ *   - create_spark_connection: POST {base}/rpc/createSparkJob     (variant sparkConnectJob, catalogs[])
+ *   - list_spark_jobs        : POST {base}/rpc/listSparkJobs      — read a job's connectUrl (sc://…)
+ *   - cancel_spark_connection: POST {base}/rpc/cancelSparkJob     { clusterId, jobId }
  *
- *   - list_catalogs : POST {base}/rpc/listCatalogs
- *       headers: x-dl-org-id, x-dl-api-version: 3, authorization: Bearer <IAM token>
- *       body:    { pageSize?, pageToken? }
+ * cluster_id in the Spark job tools is the DLP SparkCluster id (b6p...), NOT the YC managed
+ * cluster id; it falls back to the YC_SPARK_CLUSTER_ID env var.
  *
- *   - get_api_spec : GET {base}/json/ — the public OpenAPI 3.1 spec (optional path_filter)
- *
- *   - list_spark_clusters : POST {base}/rpc/listSparkClusters
- *       body: { pageSize?, pageToken?, filter? }
- *
- *   - create_spark_cluster : POST {base}/rpc/createSparkCluster
- *       body: { collectionId, cloudEnvironmentId, name, description?, labels?,
- *               config: { sparkVersion?, resourcePools: {driver, executor},
- *                         dependencies?, logging? } }
- *       returns an async LakehouseOperation — poll with get_lakehouse_operation
- *
- *   - get_lakehouse_operation : POST {base}/rpc/getLakehouseOperation
- *       body: { operationId }
- *
- * The IAM token is NOT fetched here — obtain a fresh one with the `get_iam_token` tool
- * (or `yc iam create-token`) and pass it per call (or via the DLP_IAM_TOKEN env var).
- * The org id comes from the org_id argument or the DLP_ORG_ID env var.
+ * Auth headers on every RPC: x-dl-org-id, x-dl-api-version: 3, authorization: Bearer <IAM>.
+ * The IAM token resolution per call: iam_token arg > DLP_IAM_TOKEN env > a fresh token minted
+ * via the `yc` CLI (prod: default profile, preprod: --profile sandbox-preprod). The org id
+ * comes from the org_id argument or the DLP_ORG_ID env var.
  *
  * Target environment — pass `environment: "prod" | "preprod"` per call (default prod):
  *   prod    → https://api.datalens.tech
  *   preprod → https://api.preprod.datalens.tech
  * The choice comes from the session context: when the user says they are working on
- * preprod, the model passes environment=preprod (and uses the sandbox-preprod yc
- * profile for the token). Precedence: base_url arg > environment arg > DLP_ENVIRONMENT
+ * preprod, the model passes environment=preprod (and the sandbox-preprod yc profile mints
+ * the token). Precedence: base_url arg > environment arg > DLP_ENVIRONMENT
  * env > DLP_API_BASE_URL env > prod default.
  *
  * Protocol: minimal MCP over stdio (newline-delimited JSON-RPC 2.0): initialize,
@@ -57,6 +50,7 @@
  * sql query id, and status/error text.
  * ---------------------------------------------------------------------------
  */
+import { spawn } from "node:child_process"
 import { createInterface } from "node:readline"
 import { appendFileSync, mkdirSync } from "node:fs"
 import { join } from "node:path"
@@ -101,6 +95,68 @@ function requiredArg(value, name, envVar) {
   const fromEnv = envVar && process.env[envVar]
   if (fromEnv) return fromEnv
   throw new Error(`${name} is required (pass it as an argument or set the ${envVar} environment variable)`)
+}
+
+/** Environment name for the given args (before base_url override): "prod" | "preprod". */
+function envName(args) {
+  return String(args?.environment || process.env.DLP_ENVIRONMENT || "prod").toLowerCase()
+}
+
+/** Run `yc <args...>` and resolve stdout (string). Rejects with stderr on non-zero exit. */
+function runYc(args) {
+  return new Promise((resolve, reject) => {
+    let stdout = ""
+    let stderr = ""
+    let child
+    try {
+      child = spawn("yc", args, { stdio: ["ignore", "pipe", "pipe"] })
+    } catch (err) {
+      reject(new Error(`failed to launch 'yc': ${err.message}`))
+      return
+    }
+    child.stdout.on("data", (d) => (stdout += d))
+    child.stderr.on("data", (d) => (stderr += d))
+    child.on("error", (err) =>
+      reject(new Error(`failed to launch 'yc' (is it installed and on PATH?): ${err.message}`)),
+    )
+    child.on("close", (code) => {
+      if (code === 0) resolve(stdout)
+      else reject(new Error(`yc ${args.join(" ")} exited ${code}: ${stderr.trim() || stdout.trim()}`))
+    })
+  })
+}
+
+/**
+ * Resolve the IAM token: iam_token arg > DLP_IAM_TOKEN env > fresh `yc iam create-token`
+ * (preprod: `yc --profile sandbox-preprod iam create-token`).
+ */
+async function resolveToken(args) {
+  if (args?.iam_token) return String(args.iam_token)
+  if (process.env.DLP_IAM_TOKEN) return process.env.DLP_IAM_TOKEN
+  const ycArgs =
+    envName(args) === "preprod"
+      ? ["--profile", "sandbox-preprod", "iam", "create-token"]
+      : ["iam", "create-token"]
+  return (await runYc(ycArgs)).trim()
+}
+
+/** Resolve org id + IAM token for a call. */
+async function getAuth(args) {
+  return {
+    orgId: requiredArg(args?.org_id, "org_id", "DLP_ORG_ID"),
+    token: await resolveToken(args),
+  }
+}
+
+/** Resolve the DLP Spark cluster id from the tool arg or the YC_SPARK_CLUSTER_ID env var. */
+function resolveClusterId(args) {
+  const id = args?.cluster_id || process.env.YC_SPARK_CLUSTER_ID
+  if (!id) {
+    throw new Error(
+      "cluster_id is required (pass it as an argument or set the YC_SPARK_CLUSTER_ID environment variable)",
+    )
+  }
+  return id
 }
 
 function baseUrl(args) {
@@ -234,7 +290,8 @@ const TOOLS = [
         iam_token: {
           type: "string",
           description:
-            "Yandex Cloud IAM token (Bearer). Falls back to the DLP_IAM_TOKEN env var. " +
+            "Yandex Cloud IAM token (Bearer). Optional: falls back to the DLP_IAM_TOKEN env var, " +
+            "then to a fresh `yc iam create-token` (preprod: `yc --profile sandbox-preprod iam create-token`). " +
             "Valid for at most 12 hours.",
         },
         org_id: {
@@ -265,8 +322,7 @@ const TOOLS = [
       required: ["sql_query_id"],
     },
     run: async (args) => {
-      const orgId = requiredArg(args?.org_id, "org_id", "DLP_ORG_ID")
-      const token = requiredArg(args?.iam_token, "iam_token", "DLP_IAM_TOKEN")
+      const { orgId, token } = await getAuth(args)
       if (!args?.sql_query_id) throw new Error("sql_query_id is required")
       const body = { sqlQueryId: String(args.sql_query_id) }
       const params = normalizeParams(args?.params)
@@ -295,7 +351,8 @@ const TOOLS = [
         iam_token: {
           type: "string",
           description:
-            "Yandex Cloud IAM token (Bearer). Falls back to the DLP_IAM_TOKEN env var. " +
+            "Yandex Cloud IAM token (Bearer). Optional: falls back to the DLP_IAM_TOKEN env var, " +
+            "then to a fresh `yc iam create-token` (preprod: `yc --profile sandbox-preprod iam create-token`). " +
             "Valid for at most 12 hours.",
         },
         org_id: {
@@ -327,8 +384,7 @@ const TOOLS = [
       },
     },
     run: async (args) => {
-      const orgId = requiredArg(args?.org_id, "org_id", "DLP_ORG_ID")
-      const token = requiredArg(args?.iam_token, "iam_token", "DLP_IAM_TOKEN")
+      const { orgId, token } = await getAuth(args)
       const body = {}
       if (args?.page_size != null) {
         const n = Number(args.page_size)
@@ -396,7 +452,9 @@ const TOOLS = [
       properties: {
         iam_token: {
           type: "string",
-          description: "Yandex Cloud IAM token (Bearer). Falls back to the DLP_IAM_TOKEN env var.",
+          description:
+            "Yandex Cloud IAM token (Bearer). Optional: falls back to the DLP_IAM_TOKEN env var, " +
+            "then to a fresh `yc iam create-token` (preprod: `yc --profile sandbox-preprod iam create-token`).",
         },
         org_id: { type: "string", description: "DLP organization id (x-dl-org-id). Falls back to the DLP_ORG_ID env var." },
         page_size: { type: "integer", minimum: 0, description: "Maximum number of Spark clusters to return. The default is 100." },
@@ -415,8 +473,7 @@ const TOOLS = [
       },
     },
     run: async (args) => {
-      const orgId = requiredArg(args?.org_id, "org_id", "DLP_ORG_ID")
-      const token = requiredArg(args?.iam_token, "iam_token", "DLP_IAM_TOKEN")
+      const { orgId, token } = await getAuth(args)
       const body = {}
       if (args?.page_size != null) {
         const n = Number(args.page_size)
@@ -440,7 +497,12 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        iam_token: { type: "string", description: "Yandex Cloud IAM token (Bearer). Falls back to the DLP_IAM_TOKEN env var." },
+        iam_token: {
+          type: "string",
+          description:
+            "Yandex Cloud IAM token (Bearer). Optional: falls back to the DLP_IAM_TOKEN env var, " +
+            "then to a fresh `yc iam create-token` (preprod: `yc --profile sandbox-preprod iam create-token`).",
+        },
         org_id: { type: "string", description: "DLP organization id (x-dl-org-id). Falls back to the DLP_ORG_ID env var." },
         collection_id: { type: "string", description: "Id of the DLP collection to create the cluster in." },
         cloud_environment_id: { type: "string", description: "Id of the cloud environment (from an existing cluster via list_spark_clusters)." },
@@ -475,8 +537,7 @@ const TOOLS = [
       required: ["collection_id", "cloud_environment_id", "name", "driver_resource_preset_id", "executor_resource_preset_id"],
     },
     run: async (args) => {
-      const orgId = requiredArg(args?.org_id, "org_id", "DLP_ORG_ID")
-      const token = requiredArg(args?.iam_token, "iam_token", "DLP_IAM_TOKEN")
+      const { orgId, token } = await getAuth(args)
       const body = {
         collectionId: String(args.collection_id),
         cloudEnvironmentId: String(args.cloud_environment_id),
@@ -508,7 +569,12 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        iam_token: { type: "string", description: "Yandex Cloud IAM token (Bearer). Falls back to the DLP_IAM_TOKEN env var." },
+        iam_token: {
+          type: "string",
+          description:
+            "Yandex Cloud IAM token (Bearer). Optional: falls back to the DLP_IAM_TOKEN env var, " +
+            "then to a fresh `yc iam create-token` (preprod: `yc --profile sandbox-preprod iam create-token`).",
+        },
         org_id: { type: "string", description: "DLP organization id (x-dl-org-id). Falls back to the DLP_ORG_ID env var." },
         operation_id: { type: "string", description: "Id of the lakehouse operation (create/delete cluster response id)." },
         environment: {
@@ -521,14 +587,126 @@ const TOOLS = [
       required: ["operation_id"],
     },
     run: async (args) => {
-      const orgId = requiredArg(args?.org_id, "org_id", "DLP_ORG_ID")
-      const token = requiredArg(args?.iam_token, "iam_token", "DLP_IAM_TOKEN")
+      const { orgId, token } = await getAuth(args)
       if (!args?.operation_id) throw new Error("operation_id is required")
       return callDlp({
         url: `${baseUrl(args)}/rpc/getLakehouseOperation`,
         orgId,
         token,
         body: { operationId: String(args.operation_id) },
+      })
+    },
+  },
+  {
+    name: "create_spark_connection",
+    description:
+      "Create a Spark Connect session (a SparkConnect job) on a DLP Spark cluster via the DLP RPC " +
+      "API (POST /rpc/createSparkJob, variant sparkConnectJob). cluster_id is the DLP SparkCluster " +
+      "id (b6p..., field 'id' of list_spark_clusters) — NOT the YC managed cluster id. Returns the " +
+      "created job or an async LakehouseOperation (poll with get_lakehouse_operation); read " +
+      "connectUrl via list_spark_jobs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cluster_id: {
+          type: "string",
+          description: "DLP SparkCluster id (b6p...). Falls back to the YC_SPARK_CLUSTER_ID env var.",
+        },
+        name: { type: "string", description: "Optional job name ([a-z][-a-z0-9]{1,62}[a-z0-9])." },
+        catalogs: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional REST catalog ids (from list_catalogs) to attach to the job.",
+        },
+        iam_token: {
+          type: "string",
+          description:
+            "Yandex Cloud IAM token (Bearer). Optional: falls back to the DLP_IAM_TOKEN env var, " +
+            "then to a fresh `yc iam create-token` (preprod: `yc --profile sandbox-preprod iam create-token`).",
+        },
+        org_id: { type: "string", description: "Organization id (x-dl-org-id). Falls back to the DLP_ORG_ID env var." },
+        environment: { type: "string", description: 'DLP environment: "prod" (default) or "preprod".' },
+        base_url: { type: "string", description: "Explicit API base URL override (wins over 'environment'). Rarely needed." },
+      },
+    },
+    run: async (args) => {
+      const { orgId, token } = await getAuth(args)
+      const body = { clusterId: String(resolveClusterId(args)), sparkConnectJob: {} }
+      if (args?.name) body.name = String(args.name)
+      if (Array.isArray(args?.catalogs) && args.catalogs.length) {
+        body.catalogs = args.catalogs.map((id) => ({ catalogId: String(id) }))
+      }
+      return callDlp({ url: `${baseUrl(args)}/rpc/createSparkJob`, orgId, token, body })
+    },
+  },
+  {
+    name: "list_spark_jobs",
+    description:
+      "List Spark jobs on a DLP Spark cluster via the DLP RPC API (POST /rpc/listSparkJobs). " +
+      "cluster_id is the DLP SparkCluster id (b6p...). Use it to find the running job, its status " +
+      "and its connectUrl (e.g. sc://...:443) for building a PySpark session.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cluster_id: {
+          type: "string",
+          description: "DLP SparkCluster id (b6p...). Falls back to the YC_SPARK_CLUSTER_ID env var.",
+        },
+        page_size: { type: "integer", description: "Max jobs to return (default 100)." },
+        page_token: { type: "string", description: "Token for the next page." },
+        iam_token: {
+          type: "string",
+          description:
+            "Yandex Cloud IAM token (Bearer). Optional: falls back to the DLP_IAM_TOKEN env var, " +
+            "then to a fresh `yc iam create-token` (preprod: `yc --profile sandbox-preprod iam create-token`).",
+        },
+        org_id: { type: "string", description: "Organization id (x-dl-org-id). Falls back to the DLP_ORG_ID env var." },
+        environment: { type: "string", description: 'DLP environment: "prod" (default) or "preprod".' },
+        base_url: { type: "string", description: "Explicit API base URL override (wins over 'environment'). Rarely needed." },
+      },
+    },
+    run: async (args) => {
+      const { orgId, token } = await getAuth(args)
+      const body = { clusterId: String(resolveClusterId(args)) }
+      if (args?.page_size != null) body.pageSize = Number(args.page_size)
+      if (args?.page_token) body.pageToken = String(args.page_token)
+      return callDlp({ url: `${baseUrl(args)}/rpc/listSparkJobs`, orgId, token, body })
+    },
+  },
+  {
+    name: "cancel_spark_connection",
+    description:
+      "Cancel (shut down) a SparkConnect job on a DLP Spark cluster via the DLP RPC API " +
+      "(POST /rpc/cancelSparkJob). cluster_id is the DLP SparkCluster id (b6p...). Jobs in ERROR, " +
+      "DONE, or CANCELLED status cannot be cancelled.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cluster_id: {
+          type: "string",
+          description: "DLP SparkCluster id (b6p...). Falls back to the YC_SPARK_CLUSTER_ID env var.",
+        },
+        job_id: { type: "string", description: "Id of the SparkConnect job to cancel." },
+        iam_token: {
+          type: "string",
+          description:
+            "Yandex Cloud IAM token (Bearer). Optional: falls back to the DLP_IAM_TOKEN env var, " +
+            "then to a fresh `yc iam create-token` (preprod: `yc --profile sandbox-preprod iam create-token`).",
+        },
+        org_id: { type: "string", description: "Organization id (x-dl-org-id). Falls back to the DLP_ORG_ID env var." },
+        environment: { type: "string", description: 'DLP environment: "prod" (default) or "preprod".' },
+        base_url: { type: "string", description: "Explicit API base URL override (wins over 'environment'). Rarely needed." },
+      },
+      required: ["job_id"],
+    },
+    run: async (args) => {
+      const { orgId, token } = await getAuth(args)
+      if (!args?.job_id) throw new Error("job_id is required")
+      return callDlp({
+        url: `${baseUrl(args)}/rpc/cancelSparkJob`,
+        orgId,
+        token,
+        body: { clusterId: String(resolveClusterId(args)), jobId: String(args.job_id) },
       })
     },
   },
@@ -566,6 +744,8 @@ async function handleToolCall(id, params) {
     a.org_id && `org=${a.org_id}`,
     a.sql_query_id && `query=${a.sql_query_id}`,
     a.operation_id && `op=${a.operation_id}`,
+    a.cluster_id && `cluster=${a.cluster_id}`,
+    a.job_id && `job=${a.job_id}`,
     a.name && `name=${a.name}`,
   ]
     .filter(Boolean)
@@ -589,7 +769,7 @@ async function handle(msg) {
       reply(id, {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: {} },
-        serverInfo: { name: "dlp-api", version: "0.1.0" },
+        serverInfo: { name: "dlp-api", version: "0.2.0" },
       })
       return
     case "notifications/initialized":
